@@ -1,156 +1,169 @@
-# Рассвет — Telegram Mini App
+#!/usr/bin/env python3
+"""Рассвет — Telegram-бот, который открывает Mini App и шлёт утренние напоминания."""
 
-Геймифицированный трекер утренних привычек внутри Telegram.
+from __future__ import annotations
 
-Пользователь открывает приложение из бота, отмечает подъём / зарядку / душ, получает XP и серию. Прогресс пишется в **Telegram CloudStorage**, отдельная база для квестов не нужна.
+import asyncio
+import json
+import os
+from pathlib import Path
 
-```
-rassvet-tma/
-  web/                 Mini App (статика, HTTPS)
-    index.html
-    styles.css
-    app.js
-  bot/                 бот, который открывает Mini App
-    bot.py
-    requirements.txt
-    .env.example
-  README.md
-```
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    MenuButtonWebApp,
+    Message,
+    ReplyKeyboardMarkup,
+    WebAppInfo,
+)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
-## Как это устроено
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
 
-Telegram Mini App — это обычная веб-страница, которую клиент Telegram открывает во встроенном браузере. Чтобы страница считалась приложением, нужны три вещи:
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "").strip()
+REMIND_HOUR = int(os.environ.get("REMIND_HOUR", "6"))
+REMIND_MINUTE = int(os.environ.get("REMIND_MINUTE", "20"))
+TZ_NAME = os.environ.get("TZ", "Europe/Istanbul")
+STORE = ROOT / "subscribers.json"
 
-1. Публичный **HTTPS**-адрес папки `web/`.
-2. Бот, у которого этот адрес прописан как Web App.
-3. Скрипт `https://telegram.org/js/telegram-web-app.js` на странице.
 
-Бот не хранит привычки. Он только:
+def webapp() -> WebAppInfo:
+    if not WEBAPP_URL:
+        raise RuntimeError("WEBAPP_URL не задан. Скопируй .env.example в .env")
+    return WebAppInfo(url=WEBAPP_URL)
 
-- показывает кнопку «Открыть Рассвет»;
-- ставит кнопку меню слева внизу чата;
-- по желанию шлёт утреннее сообщение (`/utro`).
 
-Имя пользователя берётся из `initDataUnsafe.user`. Для квестов этого достаточно: серверу прогресс не отправляется, подделывать чужой аккаунт на своей же странице незачем. Если позже появится рейтинг друзей — тогда `initData` уже нужно проверять на сервере по HMAC.
+def open_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🌅 Открыть Рассвет", web_app=webapp())]
+        ]
+    )
 
-## 1. Выложи фронт на HTTPS
 
-Подойдёт любой статичный хостинг.
+def reply_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Открыть Рассвет", web_app=webapp())]],
+        resize_keyboard=True,
+    )
 
-### Вариант A — GitHub Pages
 
-1. Создай репозиторий и залей папку `web/` в корень (или в `/docs`).
-2. GitHub → Settings → Pages → Deploy from branch.
-3. Адрес будет вида `https://USERNAME.github.io/REPO/`.
-4. Проверь, что открывается именно `index.html`.
+def load_subs() -> set[int]:
+    if not STORE.exists():
+        return set()
+    try:
+        data = json.loads(STORE.read_text(encoding="utf-8"))
+        return {int(x) for x in data}
+    except Exception:
+        return set()
 
-### Вариант B — Cloudflare Pages / Netlify
 
-Перетащи папку `web/` в интерфейс. Получишь `https://....pages.dev`.
+def save_subs(subs: set[int]) -> None:
+    STORE.write_text(json.dumps(sorted(subs)), encoding="utf-8")
 
-### Вариант C — локальная разработка
 
-```bash
-cd web
-python3 -m http.server 8080
-```
+SUBS = load_subs()
 
-В соседнем терминале подними HTTPS-туннель (ngrok, Cloudflare Tunnel, localtunnel) и этот `https://...` временно пропиши боту.
+WELCOME = (
+    "<b>Рассвет</b> — мини-игра про утро.\n\n"
+    "Отмечай подъём, зарядку, душ и любые свои ритуалы. "
+    "За это капают XP, растёт серия и открываются звания.\n\n"
+    "Прогресс хранится в облаке Telegram, отдельно сервер для квестов не нужен.\n\n"
+    "Команды:\n"
+    "/utro — включить утреннее напоминание\n"
+    "/off — выключить напоминание"
+)
 
-Telegram **не откроет** `http://` и не откроет `file://`.
 
-## 2. Создай бота
+async def cmd_start(message: Message) -> None:
+    await message.answer(WELCOME, reply_markup=open_kb())
+    await message.answer("Кнопка внизу тоже открывает приложение.", reply_markup=reply_kb())
 
-1. Открой [@BotFather](https://t.me/BotFather).
-2. `/newbot` → имя, например `Рассвет`, юзернейм `rassvet_quest_bot`.
-3. Сохрани токен `123456:ABC...`.
-4. `/newapp` → выбери бота → название `Рассвет` → короткое имя `rassvet` → залей иконку (необязательно) → вставь HTTPS-ссылку на `web/`.
-5. BotFather выдаст прямую ссылку `https://t.me/rassvet_quest_bot/rassvet`.
-6. Дополнительно `/setmenubutton` → тот же URL → текст `Рассвет`.
-7. `/setdomain` — домен без `https://`, тот же, что у хостинга.
 
-Короткое имя приложения даёт диплинк вида `https://t.me/<bot>/<app>`. Им можно делиться, диалог с ботом открывать не обязательно.
+async def cmd_app(message: Message) -> None:
+    await message.answer("Открывай квесты дня:", reply_markup=open_kb())
 
-## 3. Запусти бота
 
-На машине, которая будет онлайн (VPS, домашний сервер, даже ноутбук на время теста):
+async def cmd_utro(message: Message) -> None:
+    SUBS.add(message.chat.id)
+    save_subs(SUBS)
+    await message.answer(
+        f"Напоминание включено. Буду писать около "
+        f"{REMIND_HOUR:02d}:{REMIND_MINUTE:02d} ({TZ_NAME}).",
+        reply_markup=open_kb(),
+    )
 
-```bash
-cd bot
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-```
 
-Отредактируй `.env`:
+async def cmd_off(message: Message) -> None:
+    SUBS.discard(message.chat.id)
+    save_subs(SUBS)
+    await message.answer("Напоминания выключены. Квесты по-прежнему в приложении.")
 
-```
-BOT_TOKEN=123456:ABC...
-WEBAPP_URL=https://USERNAME.github.io/REPO/
-REMIND_HOUR=6
-REMIND_MINUTE=20
-TZ=Europe/Istanbul
-```
 
-`WEBAPP_URL` обязан совпадать с тем, что указан в BotFather, и быть с `https://`.
+async def morning_ping(bot: Bot) -> None:
+    text = (
+        "Утро. Квесты ждут: подъём, движение, душ.\n"
+        "Отметь то, что уже сделал — серия не любит пустые дни."
+    )
+    dead: list[int] = []
+    for chat_id in list(SUBS):
+        try:
+            await bot.send_message(chat_id, text, reply_markup=open_kb())
+        except Exception:
+            dead.append(chat_id)
+    if dead:
+        for chat_id in dead:
+            SUBS.discard(chat_id)
+        save_subs(SUBS)
 
-```bash
-python bot.py
-```
 
-Напиши боту `/start`. Должна появиться синяя кнопка, которая открывает Mini App на весь экран.
+async def main() -> None:
+    if not BOT_TOKEN or BOT_TOKEN.endswith("REPLACE_ME"):
+        raise SystemExit("Укажи BOT_TOKEN в bot/.env")
+    if not WEBAPP_URL.startswith("https://"):
+        raise SystemExit("WEBAPP_URL должен быть публичным https:// адресом папки web/")
 
-Чтобы бот жил постоянно:
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.message.register(cmd_start, CommandStart())
+    dp.message.register(cmd_app, Command("app"))
+    dp.message.register(cmd_utro, Command("utro"))
+    dp.message.register(cmd_off, Command("off"))
+    dp.message.register(cmd_app, F.text.func(lambda t: t and "рассвет" in t.lower()))
 
-```bash
-# пример
-nohup python bot.py > bot.log 2>&1 &
-```
+    await bot.set_chat_menu_button(
+        menu_button=MenuButtonWebApp(text="Рассвет", web_app=webapp())
+    )
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Открыть Рассвет"),
+                BotCommand(command="app", description="Кнопка Mini App"),
+                BotCommand(command="utro", description="Включить напоминание"),
+                BotCommand(command="off", description="Выключить напоминание"),
+            ]
+        )
+    except Exception:
+        pass
 
-Или systemd / Docker — как удобно. Для теста достаточно открытого терминала.
+    tz = ZoneInfo(TZ_NAME)
+    scheduler = AsyncIOScheduler(timezone=tz)
+    scheduler.add_job(morning_ping, "cron", hour=REMIND_HOUR, minute=REMIND_MINUTE, args=[bot])
+    scheduler.start()
 
-## 4. Что увидит пользователь
+    print(f"Рассвет-бот запущен. Mini App: {WEBAPP_URL}")
+    await dp.start_polling(bot)
 
-- Приветствие со своим именем из Telegram.
-- Квесты: подъём в 6:00, зарядка, душ, вода, свет.
-- Нижняя системная кнопка Telegram «НОВЫЙ КВЕСТ».
-- Вибрация при отметке.
-- Календарь, уровни, достижения.
-- Сохранение в CloudStorage: прогресс не пропадёт при смене телефона, если это тот же Telegram-аккаунт и тот же бот.
 
-Лимит CloudStorage: значение не длиннее 4096 символов. Поэтому логи пишутся по месяцам (`m2026_09`), а не одним огромным JSON.
-
-## Команды бота
-
-| Команда | Действие |
-|---|---|
-| `/start` | Приветствие и кнопка Mini App |
-| `/app` | Ещё раз прислать кнопку |
-| `/utro` | Включить утреннее сообщение |
-| `/off` | Выключить сообщение |
-
-Список подписчиков хранится в `bot/subscribers.json`. Это не прогресс игры, только chat_id для пуша.
-
-Кнопка «Разрешить боту писать» в приложении вызывает `requestWriteAccess`. Без этого Telegram может резать сообщения пользователям, которые сами боту ничего не писали. `/utro` после `/start` обычно достаточно.
-
-## Предпросмотр без Telegram
-
-Открой `web/index.html` в обычном браузере. Приложение работает, сверху жёлтая плашка. Данные тогда только в `localStorage` этого браузера.
-
-## Частые ошибки
-
-- **Белый экран в Telegram.** URL не HTTPS, или указан каталог без `index.html`, или смешанный контент.
-- **Кнопка не открывает приложение.** В BotFather прописан другой домен. `/setdomain` и URL кнопки должны совпадать.
-- **Прогресс не синхронизируется.** CloudStorage доступен только внутри клиента Telegram, не в Safari/Chrome снаружи.
-- **Бот молчит.** Не запущен `bot.py`, неверный токен, или машина без интернета.
-- **Напоминание не приходит.** Не нажато `/utro`, неверный `TZ`, процесс бота уснул.
-
-## Куда расти
-
-- Сервер и таблица лидеров: принимать `initData`, проверять HMAC, хранить XP в Postgres.
-- Вечерний блок квестов отдельно от утра.
-- Комната на двоих: общий босс недели.
-- Telegram Stars за косметику звания — только если появится живая аудитория.
-
-Для личного режима текущего пакета хватает: статика + маленький бот.
+if __name__ == "__main__":
+    asyncio.run(main())
